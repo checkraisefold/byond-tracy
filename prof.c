@@ -117,6 +117,8 @@ _Static_assert(sizeof(long long) == 8, "incorrect size");
 char *getenv(char const *);
 #endif
 
+#include <stdio.h>
+#include <sys/stat.h>
 #include <stddef.h>
 #include <assert.h>
 
@@ -196,6 +198,11 @@ size_t strlen(char const *const a) {
 #	else
 #		define UTRACY_MEMCPY memcpy
 #	endif
+#	if __has_builtin(__builtin_malloc)
+#		define UTRACY_MALLOC __builtin_malloc
+#	else
+#		define UTRACY_MALLOC malloc
+#	endif
 #	if __has_builtin(__builtin_memset)
 #		define UTRACY_MEMSET __builtin_memset
 #	else
@@ -207,6 +214,7 @@ size_t strlen(char const *const a) {
 #		define UTRACY_MEMCMP memcmp
 #	endif
 #else
+#	define UTRACY_MALLOC malloc
 #	define UTRACY_MEMCPY memcpy
 #	define UTRACY_MEMSET memset
 #	define UTRACY_MEMCMP memcmp
@@ -215,7 +223,6 @@ size_t strlen(char const *const a) {
 
 /* debugging */
 #if defined(UTRACY_DEBUG) || defined(DEBUG)
-#	include <stdio.h>
 #	define LOG_DEBUG_ERROR fprintf(stderr, "err: %s %s:%d\n", __func__, __FILE__, __LINE__)
 #	define LOG_INFO(...) fprintf(stdout, __VA_ARGS__)
 #else
@@ -1321,6 +1328,7 @@ static struct {
 		char unsigned response_symbol_code_unavail;
 		char unsigned response_string_data;
 		char unsigned response_thread_name;
+		char unsigned response_source_code;
 
 		char unsigned query_terminate;
 		char unsigned query_string;
@@ -1357,6 +1365,9 @@ static struct {
 		int unsigned raw_buf_head;
 		int unsigned raw_buf_tail;
 		char raw_buf[UTRACY_MAX_FRAME_SIZE * 3];
+
+		char *query_data;
+		char *query_data_offset;
 
 		int unsigned frame_buf_len;
 		char frame_buf[sizeof(int) + LZ4_COMPRESSBOUND(UTRACY_MAX_FRAME_SIZE)];
@@ -1892,6 +1903,7 @@ int utracy_protocol_init(int unsigned version) {
 			utracy.protocol.response_symbol_code_unavail = 93;
 			utracy.protocol.response_string_data = 98;
 			utracy.protocol.response_thread_name = 99;
+			utracy.protocol.response_source_code = 109;
 
 			utracy.protocol.query_terminate = 0;
 			utracy.protocol.query_string = 1;
@@ -1917,6 +1929,7 @@ int utracy_protocol_init(int unsigned version) {
 			utracy.protocol.response_symbol_code_unavail = 94;
 			utracy.protocol.response_string_data = 99;
 			utracy.protocol.response_thread_name = 100;
+			utracy.protocol.response_source_code = 110;
 
 			utracy.protocol.query_terminate = 0;
 			utracy.protocol.query_string = 1;
@@ -2246,6 +2259,36 @@ int utracy_write_srcloc(struct utracy_source_location const *const srcloc) {
 }
 
 UTRACY_INTERNAL UTRACY_INLINE
+int utracy_write_longstringdata(char unsigned type, char const *const str, long long unsigned ptr, unsigned int len) {
+#pragma pack(push, 1)
+	struct network_query_longstringdata {
+		char unsigned type;
+		long long unsigned ptr;
+		int unsigned len;
+		char str[];
+	};
+	_Static_assert(13 == sizeof(struct network_query_longstringdata), "incorrect size");
+#pragma pack(pop)
+
+	size_t size = sizeof(struct network_query_longstringdata) + len;
+	struct network_query_longstringdata *msg = (struct network_query_longstringdata *) UTRACY_MALLOC(size);
+
+	msg->type = type;
+	msg->ptr = ptr;
+	msg->len = len;
+	(void) UTRACY_MEMCPY(msg->str, str, len);
+
+	if(0 != utracy_write_packet(msg, size)) {
+		free(msg);
+		LOG_DEBUG_ERROR;
+		return -1;
+	}
+
+	free(msg);
+	return 0;
+}
+
+UTRACY_INTERNAL UTRACY_INLINE
 int utracy_write_stringdata(char unsigned type, char const *const str, long long unsigned ptr) {
 #pragma pack(push, 1)
 	struct network_query_stringdata {
@@ -2291,11 +2334,11 @@ int utracy_write_symbol_code(void) {
 UTRACY_INTERNAL UTRACY_INLINE
 int utracy_write_source_code(int unsigned id) {
 #pragma pack(push, 1)
-	struct network_response_source_code {
+	struct network_response_source_code_unavail {
 		char unsigned type;
 		int unsigned id;
 	};
-	_Static_assert(5 == sizeof(struct network_response_source_code), "incorrect size");
+	_Static_assert(5 == sizeof(struct network_response_source_code_unavail), "incorrect size");
 #pragma pack(pop)
 
 	switch(utracy.protocol.version) {
@@ -2312,14 +2355,38 @@ int utracy_write_source_code(int unsigned id) {
 		case UTRACY_PROTOCOL_0_9_0:
 		case UTRACY_PROTOCOL_0_10_0:
 		case UTRACY_PROTOCOL_0_11_0:;
-			struct network_response_source_code msg = {
-				.type = utracy.protocol.response_source_code_unavail,
-				.id = id
-			};
+			FILE *source_file = fopen(utracy.data.query_data, "rb");
+			struct stat st;
+			int ok = TRUE;
+			if(NULL == source_file) {
+				ok = FALSE;
+			}
+			if(ok && (0 != fstat(_fileno(source_file), &st))) {
+				ok = FALSE;
+			}
+			if(TRUE == ok) {
+				char *file_data = UTRACY_MALLOC(st.st_size);
+				if(st.st_size == fread(file_data, 1, st.st_size, source_file)) {
+					if(0 != utracy_write_longstringdata(utracy.protocol.response_source_code, file_data, id, st.st_size)) {
+						LOG_DEBUG_ERROR;
+						return -1;
+					}
+				} else {
+					ok = FALSE;
+					free(file_data);
+				}
+			}
 
-			if(0 != utracy_write_packet(&msg, sizeof(msg))) {
-				LOG_DEBUG_ERROR;
-				return -1;
+			if(FALSE == ok) {
+				struct network_response_source_code_unavail msg = {
+					.type = utracy.protocol.response_source_code_unavail,
+					.id = id
+				};
+
+				if(0 != utracy_write_packet(&msg, sizeof(msg))) {
+					LOG_DEBUG_ERROR;
+					return -1;
+				}
 			}
 			break;
 	}
@@ -2327,15 +2394,46 @@ int utracy_write_source_code(int unsigned id) {
 	return 0;
 }
 
-UTRACY_INTERNAL UTRACY_INLINE
-int utracy_write_data_part(void) {
+UTRACY_INTERNAL
+int utracy_send_query_noop(void) {
 	char unsigned response = utracy.protocol.response_server_query_noop;
-
 	if(0 != utracy_write_packet(&response, sizeof(response))) {
 		LOG_DEBUG_ERROR;
 		return -1;
 	}
+	return 0;
+}
 
+UTRACY_INTERNAL
+int utracy_write_data(unsigned int size) {
+	if(NULL != utracy.data.query_data) {
+		free(utracy.data.query_data);
+	}
+	utracy.data.query_data = utracy.data.query_data_offset = UTRACY_MALLOC(size + 11);
+
+	if(0 != utracy_send_query_noop()) {
+		LOG_DEBUG_ERROR;
+		return -1;
+	}
+	return 0;
+}
+
+UTRACY_INTERNAL
+int utracy_write_data_part(void* part_one, void* part_two) {
+	if(utracy.data.query_data == NULL) {
+		utracy_send_query_noop();
+		LOG_DEBUG_ERROR;
+		return -1;
+	}
+
+	UTRACY_MEMCPY(utracy.data.query_data_offset, part_one, 8);
+	UTRACY_MEMCPY(utracy.data.query_data_offset + 8, part_two, 4);
+	utracy.data.query_data_offset += 12;
+
+	if(0 != utracy_send_query_noop()) {
+		LOG_DEBUG_ERROR;
+		return -1;
+	}
 	return 0;
 }
 
@@ -2386,8 +2484,14 @@ int utracy_consume_request(void) {
 			return -1;
 		}
 
-	} else if(req.type == utracy.protocol.query_data_transfer || req.type == utracy.protocol.query_data_transfer_part) {
-		if(0 != utracy_write_data_part()) {
+	} else if(req.type == utracy.protocol.query_data_transfer) {
+		if(0 != utracy_write_data((int unsigned) req.ptr)) {
+			LOG_DEBUG_ERROR;
+			return -1;
+		}
+
+	} else if(req.type == utracy.protocol.query_data_transfer_part) {
+		if(0 != utracy_write_data_part((void *) &req.ptr, (void *) &req.extra)) {
 			LOG_DEBUG_ERROR;
 			return -1;
 		}
